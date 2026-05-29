@@ -208,7 +208,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 UseVwap                 = true;
                 UseVol                  = false;   // override actual del usuario
                 VolLen                  = 20;
-                UseDelta                = true;
+                UseDelta                = false;  // requiere subscription "Order Flow+" en NT; default OFF
                 DeltaPctMin             = 50.0;
                 AtrLen                  = 14;
                 SlAtr                   = 1.0;
@@ -225,11 +225,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // O/H/L/C del día previo cerrado para PDH/PDL/PDC.
                 AddDataSeries(Instrument.FullName, BarsPeriodType.Day, 1);
 
-                // BarsArray[2] = serie de Tick necesaria para que
-                // OrderFlowCumulativeDelta resuelva el delta bid/ask por barra
-                // sin pedir datos adicionales en runtime (error reportado en
-                // backtest del 2026-05-28: "tried to load additional data").
-                AddDataSeries(Instrument.FullName, BarsPeriodType.Tick, 1);
+                // BarsArray[2] = serie de Tick para alimentar a
+                // OrderFlowCumulativeDelta SOLO si el filtro Delta está activo.
+                // Si UseDelta=false (default) NO se carga — ahorra recursos y
+                // evita warnings de subscription Order Flow+ ausente.
+                if (UseDelta)
+                {
+                    AddDataSeries(Instrument.FullName, BarsPeriodType.Tick, 1);
+                }
             }
             else if (State == State.DataLoaded)
             {
@@ -237,11 +240,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                 sma20    = SMA(BarsArray[0], 20);
                 volSma   = SMA(Volumes[0], VolLen);
                 atr      = ATR(BarsArray[0], AtrLen);
-                cumDelta = OrderFlowCumulativeDelta(
-                              BarsArray[0],
-                              CumulativeDeltaType.BidAsk,
-                              CumulativeDeltaPeriod.Bar,
-                              0);
+
+                // OrderFlowCumulativeDelta requiere subscription "Order Flow+"
+                // en NinjaTrader. Si el usuario no la tiene activa, el filtro
+                // Delta se desactiva silenciosamente (deltaOk = true siempre)
+                // y el bot opera con los demás filtros (PDH/PDL/OR + EMA/VWAP/Vol).
+                if (UseDelta)
+                {
+                    try
+                    {
+                        cumDelta = OrderFlowCumulativeDelta(
+                                      BarsArray[0],
+                                      CumulativeDeltaType.BidAsk,
+                                      CumulativeDeltaPeriod.Bar,
+                                      0);
+                    }
+                    catch (Exception ex)
+                    {
+                        cumDelta = null;
+                        Print($"WARN: OrderFlowCumulativeDelta no disponible — el filtro Delta se omite. Detalle: {ex.Message}");
+                    }
+                }
 
                 cdmxTz    = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time (Mexico)");
                 chicagoTz = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
@@ -355,12 +374,19 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             bool volOk     = !UseVol  || Volume[0] > volSma[0];
 
-            double deltaBar = cumDelta.DeltaClose[0];
-            double deltaPct = (UseDelta && Volume[0] > 0)
-                              ? Math.Abs(deltaBar) / Volume[0] * 100.0
-                              : 0;
-            bool deltaBull  = !UseDelta || (deltaBar > 0 && deltaPct >= DeltaPctMin);
-            bool deltaBear  = !UseDelta || (deltaBar < 0 && deltaPct >= DeltaPctMin);
+            // Filtro Delta: solo se aplica si UseDelta=true Y cumDelta se pudo
+            // instanciar (requiere subscription "Order Flow+"). Si cumDelta es
+            // null, el filtro se omite gracefully y deltaBull/deltaBear = true.
+            double deltaPct = 0;
+            bool deltaBull = true, deltaBear = true;
+            if (UseDelta && cumDelta != null)
+            {
+                double deltaBar = cumDelta.DeltaClose[0];
+                if (Volume[0] > 0)
+                    deltaPct = Math.Abs(deltaBar) / Volume[0] * 100.0;
+                deltaBull = deltaBar > 0 && deltaPct >= DeltaPctMin;
+                deltaBear = deltaBar < 0 && deltaPct >= DeltaPctMin;
+            }
 
             // ---- 8. Detección de rompimientos (cruce desde la barra previa)
             bool breakPdh = UsePdhPdl       && !double.IsNaN(pdh) && Close[1] <= pdh && Close[0] > pdh;
