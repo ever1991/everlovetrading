@@ -1,0 +1,23 @@
+# NinjaTrader build outputs
+*.dll
+*.pdb
+bin/
+obj/
+
+# Editor / OS
+.DS_Store
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+
+# Secrets — nunca commitear credenciales
+*.env
+*.env.local
+secrets/
+*credentials*
+*api-keys*
+
+# Logs
+*.log
