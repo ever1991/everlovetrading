@@ -438,13 +438,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                 //   → es nuestro SL o TP del bracket OCO. Cierre normal.
                 // - Si no, o si es una market order sin nuestro signal name (cierre
                 //   manual del usuario, Emotional Manager, otra Strategy) → externo.
+                // - PERO si el cierre ocurre FUERA de nuestra ventana de operación
+                //   (antes de 8:30 o después de 12:00 CDMX), casi seguro es el
+                //   IsExitOnSessionCloseStrategy del propio bot (cierra al session
+                //   close del exchange ~15:00 CDMX) o un cierre manual fuera de
+                //   horas. En esos casos NO marcamos session-lock porque ya no
+                //   íbamos a operar más hoy de todos modos.
                 string fromSignal = execution.Order.FromEntrySignal ?? string.Empty;
                 bool isOurExit = fromSignal == "Long_break" || fromSignal == "Short_break";
 
                 if (!isOurExit && !sessionLocked)
                 {
-                    sessionLocked = true;
-                    Print($"[{time:HH:mm}] Cierre EXTERNO detectado (FromEntrySignal='{fromSignal}', OrderType={execution.Order.OrderType}) — bot SESSION-LOCKED hasta mañana.");
+                    DateTime tCdmxExec = ConvertChicagoToCdmx(time);
+                    int hhmmExec = tCdmxExec.Hour * 100 + tCdmxExec.Minute;
+                    bool insideSession = hhmmExec >= SessionStartCdmx && hhmmExec < SessionEndCdmx;
+
+                    if (insideSession)
+                    {
+                        sessionLocked = true;
+                        Print($"[{tCdmxExec:HH:mm}] Cierre EXTERNO detectado dentro de sesión (FromEntrySignal='{fromSignal}', OrderType={execution.Order.OrderType}) — bot SESSION-LOCKED hasta mañana.");
+                    }
+                    else
+                    {
+                        Print($"[{tCdmxExec:HH:mm}] Cierre fuera de ventana (FromEntrySignal='{fromSignal}', OrderType={execution.Order.OrderType}) — probable ExitOnSessionClose del exchange, no se aplica session-lock.");
+                    }
                 }
             }
         }
