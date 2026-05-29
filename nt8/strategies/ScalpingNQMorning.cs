@@ -137,10 +137,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Indicadores
         private EMA ema8;
         private SMA sma20;
-        private VWAP vwap;
         private SMA volSma;
         private ATR atr;
         private OrderFlowCumulativeDelta cumDelta;
+
+        // VWAP calculado manualmente (reset diario, evita depender del indicador VWAP
+        // nativo que no existe con ese nombre en todas las versiones de NT8)
+        private double vwapNumerator = 0;
+        private double vwapDenominator = 0;
+        private DateTime vwapResetDate = DateTime.MinValue;
+        private double currentVwap = double.NaN;
 
         // Niveles del día previo (calculados desde DataSeries diaria, BarsArray[1])
         private double pdh = double.NaN, pdl = double.NaN, pdc = double.NaN;
@@ -223,7 +229,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 ema8     = EMA(BarsArray[0], 8);
                 sma20    = SMA(BarsArray[0], 20);
-                vwap     = VWAP(BarsArray[0]);
                 volSma   = SMA(Volumes[0], VolLen);
                 atr      = ATR(BarsArray[0], AtrLen);
                 cumDelta = OrderFlowCumulativeDelta(
@@ -272,6 +277,23 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 Print($"[{tCdmx:yyyy-MM-dd}] Nuevo día — PDH={pdh:F2} PDL={pdl:F2} PDC={pdc:F2}");
             }
+
+            // ---- 2b. VWAP intradía calculado manualmente (reset diario CDMX)
+            //         Fórmula estándar: Σ(typicalPrice × volume) / Σ(volume).
+            //         Más portable que el indicador VWAP nativo, que no existe
+            //         con ese nombre en todas las versiones de NT8.
+            if (today != vwapResetDate)
+            {
+                vwapNumerator   = 0;
+                vwapDenominator = 0;
+                vwapResetDate   = today;
+            }
+            double typicalPrice = (High[0] + Low[0] + Close[0]) / 3.0;
+            vwapNumerator   += typicalPrice * Volume[0];
+            vwapDenominator += Volume[0];
+            currentVwap      = vwapDenominator > 0
+                               ? vwapNumerator / vwapDenominator
+                               : Close[0];
 
             // ---- 3. Sesión activa?
             bool inSession = hhmmNow >= SessionStartCdmx && hhmmNow < SessionEndCdmx;
@@ -322,9 +344,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool emaBull = !UseEma  || ema8[0] > sma20[0];
             bool emaBear = !UseEma  || ema8[0] < sma20[0];
 
-            double vwapVal = vwap.Value[0];
-            bool vwapBull  = !UseVwap || Close[0] > vwapVal;
-            bool vwapBear  = !UseVwap || Close[0] < vwapVal;
+            bool vwapBull  = !UseVwap || Close[0] > currentVwap;
+            bool vwapBear  = !UseVwap || Close[0] < currentVwap;
 
             bool volOk     = !UseVol  || Volume[0] > volSma[0];
 
