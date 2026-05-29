@@ -221,9 +221,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                // Series diaria del MISMO instrumento → BarsArray[1] entrega
-                // O/H/L/C del día previo cerrado.
+                // BarsArray[1] = serie diaria del MISMO instrumento → da
+                // O/H/L/C del día previo cerrado para PDH/PDL/PDC.
                 AddDataSeries(Instrument.FullName, BarsPeriodType.Day, 1);
+
+                // BarsArray[2] = serie de Tick necesaria para que
+                // OrderFlowCumulativeDelta resuelva el delta bid/ask por barra
+                // sin pedir datos adicionales en runtime (error reportado en
+                // backtest del 2026-05-28: "tried to load additional data").
+                AddDataSeries(Instrument.FullName, BarsPeriodType.Tick, 1);
             }
             else if (State == State.DataLoaded)
             {
