@@ -345,17 +345,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            // ---- 5. Detección de cierre externo (Emotional Manager u otro)
-            //         Si estábamos en posición y aparecemos Flat sin haber sido
-            //         nuestros SL/TP los que cerraron → asumir externo.
-            if (lastObservedPosition != MarketPosition.Flat
-                && Position.MarketPosition == MarketPosition.Flat
-                && !sessionLocked)
-            {
-                // Conservador: cualquier flat inesperado bloquea el resto del día.
-                sessionLocked = true;
-                Print($"[{tCdmx:HH:mm}] Posición cerrada externamente — bot SESSION-LOCKED hasta mañana.");
-            }
+            // ---- 5. Detección de cierre externo MOVIDA a OnExecutionUpdate.
+            //         Comparar lastObservedPosition vs Position.MarketPosition
+            //         aquí produce falsos positivos porque el bracket OCO del bot
+            //         (SetStopLoss/SetProfitTarget) también lleva la posición a
+            //         Flat tras un fill, indistinguible de un cierre externo.
+            //         Ahora la detección se hace en OnExecutionUpdate filtrando
+            //         por execution.Order.FromEntrySignal: si trae nuestro signal
+            //         name ("Long_break"/"Short_break") = cierre interno; si no =
+            //         externo y session-lock.
             lastObservedPosition = Position.MarketPosition;
 
             // ---- 6. Guardrails
@@ -424,7 +422,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (execution.Order == null) return;
             if (execution.Order.OrderState != OrderState.Filled) return;
 
-            // Cuando la posición vuelve a Flat = trade cerrado
+            // Cuando la posición vuelve a Flat = trade cerrado (interno o externo)
             if (Position.MarketPosition == MarketPosition.Flat
                 && SystemPerformance.AllTrades.Count > 0)
             {
@@ -434,6 +432,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lifetimeRealizedPnL = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
 
                 Print($"[{time:HH:mm}] Trade cerrado P&L=${profit:F2}  día=${realizedPnLToday:F2}  total=${lifetimeRealizedPnL:F2}");
+
+                // Detección robusta de cierre externo:
+                // - Si la orden ejecutada tiene FromEntrySignal == Long_break / Short_break
+                //   → es nuestro SL o TP del bracket OCO. Cierre normal.
+                // - Si no, o si es una market order sin nuestro signal name (cierre
+                //   manual del usuario, Emotional Manager, otra Strategy) → externo.
+                string fromSignal = execution.Order.FromEntrySignal ?? string.Empty;
+                bool isOurExit = fromSignal == "Long_break" || fromSignal == "Short_break";
+
+                if (!isOurExit && !sessionLocked)
+                {
+                    sessionLocked = true;
+                    Print($"[{time:HH:mm}] Cierre EXTERNO detectado (FromEntrySignal='{fromSignal}', OrderType={execution.Order.OrderType}) — bot SESSION-LOCKED hasta mañana.");
+                }
             }
         }
 
