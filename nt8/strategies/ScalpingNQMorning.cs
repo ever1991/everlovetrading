@@ -1,0 +1,436 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Threading.Tasks;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.NinjaScript;
+using NinjaTrader.Gui.SuperDom;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+using NinjaTrader.NinjaScript.Indicators;
+using NinjaTrader.NinjaScript.Strategies;
+#endregion
+
+// ============================================================================
+// ScalpingNQMorning  —  port a NinjaScript del Pine v4
+//   "Scalping NQ Morning - Breakout Signals"
+//
+// Estrategia: rompimiento de PDH/PDL/Opening Range en sesión 8:30-12:00 CDMX
+// sobre NQ/MNQ, con filtros combinados EMA8>SMA20 + lado de VWAP + volumen
+// > promedio + delta orderflow ≥ deltaPctMin.
+//
+// REQUISITOS NT8:
+//   1. NT8 8.1+ (para OrderFlowCumulativeDelta nativo)
+//   2. Tick Replay habilitado en la connection (Tools → Options → Market data)
+//   3. Subscription a data con Volumetric Bars / Order Flow (Apex/Rithmic ✓)
+//
+// Diseño defensivo (Apex 50K + Emotional Manager + Replicator):
+//   • Si el Emotional Manager cierra la posición externamente, el bot
+//     detecta Flat-inesperado y se session-lockea hasta el siguiente día.
+//   • Daily loss interno $300 (más estricto que el cap $1k del gestor)
+//   • Auto-disable al alcanzar +$3000 lifetime (señal para mover a PA)
+//
+// Repo: https://github.com/ever1991/everlovetrading
+// ============================================================================
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class ScalpingNQMorning : Strategy
+    {
+        // ===================== INPUTS =====================
+        #region Inputs
+
+        // ---------- Sesión (en hora CDMX, conversión automática) ----------
+        [Range(0, 2359), NinjaScriptProperty]
+        [Display(Name = "Inicio sesión (HHMM CDMX)", Description = "Ej: 830 = 8:30am CDMX", GroupName = "1. Sesión", Order = 0)]
+        public int SessionStartCdmx { get; set; }
+
+        [Range(0, 2359), NinjaScriptProperty]
+        [Display(Name = "Fin sesión (HHMM CDMX)", Description = "Ej: 1200 = 12:00pm CDMX", GroupName = "1. Sesión", Order = 1)]
+        public int SessionEndCdmx { get; set; }
+
+        [Range(1, 120), NinjaScriptProperty]
+        [Display(Name = "Opening Range (min)", Description = "Minutos desde apertura para fijar OR High/Low", GroupName = "1. Sesión", Order = 2)]
+        public int OpeningRangeMins { get; set; }
+
+        // ---------- Niveles del día previo ----------
+        [NinjaScriptProperty]
+        [Display(Name = "Operar rompimiento PDH/PDL", GroupName = "2. Niveles", Order = 0)]
+        public bool UsePdhPdl { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Operar rompimiento OR High/Low", GroupName = "2. Niveles", Order = 1)]
+        public bool UseOpeningRange { get; set; }
+
+        // ---------- Filtros técnicos ----------
+        [NinjaScriptProperty]
+        [Display(Name = "Filtro EMA8 vs SMA20 (tendencia)", GroupName = "3. Filtros", Order = 0)]
+        public bool UseEma { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Filtro VWAP (lado correcto)", GroupName = "3. Filtros", Order = 1)]
+        public bool UseVwap { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Filtro Volumen > promedio", GroupName = "3. Filtros", Order = 2)]
+        public bool UseVol { get; set; }
+
+        [Range(1, 200), NinjaScriptProperty]
+        [Display(Name = "Volumen — periodo promedio", GroupName = "3. Filtros", Order = 3)]
+        public int VolLen { get; set; }
+
+        // ---------- Delta orderflow ----------
+        [NinjaScriptProperty]
+        [Display(Name = "Filtro Delta (orderflow)", GroupName = "4. Delta", Order = 0)]
+        public bool UseDelta { get; set; }
+
+        [Range(0, 100), NinjaScriptProperty]
+        [Display(Name = "Delta % mínimo de la barra", Description = "|delta/volumen| × 100. Default 50 (era 60 en Pine v4, bajado tras 2 sesiones sin señales).", GroupName = "4. Delta", Order = 1)]
+        public double DeltaPctMin { get; set; }
+
+        // ---------- Riesgo / size ----------
+        [Range(1, 200), NinjaScriptProperty]
+        [Display(Name = "ATR length", GroupName = "5. Riesgo", Order = 0)]
+        public int AtrLen { get; set; }
+
+        [Range(0.1, 5.0), NinjaScriptProperty]
+        [Display(Name = "Stop Loss (× ATR)", GroupName = "5. Riesgo", Order = 1)]
+        public double SlAtr { get; set; }
+
+        [Range(0.1, 10.0), NinjaScriptProperty]
+        [Display(Name = "Risk:Reward (TP = SL × RR)", GroupName = "5. Riesgo", Order = 2)]
+        public double RrRatio { get; set; }
+
+        [Range(1, 60), NinjaScriptProperty]
+        [Display(Name = "Contratos por trade (MNQ)", Description = "Apex 50K: máx 60 MNQ. Default 5 alineado a la spec.", GroupName = "5. Riesgo", Order = 3)]
+        public int ContractsQty { get; set; }
+
+        // ---------- Guardrails (Apex + defensa en profundidad) ----------
+        [Range(1, 50), NinjaScriptProperty]
+        [Display(Name = "Max trades por día", GroupName = "6. Guardrails", Order = 0)]
+        public int MaxTradesPerDay { get; set; }
+
+        [Range(0, 5000), NinjaScriptProperty]
+        [Display(Name = "Daily loss cap USD (apaga día)", Description = "$300 por defecto, más estricto que el $1k del Emotional Manager.", GroupName = "6. Guardrails", Order = 1)]
+        public double DailyLossCapUsd { get; set; }
+
+        [Range(0, 5000), NinjaScriptProperty]
+        [Display(Name = "Daily profit cap USD (apaga día)", Description = "Apaga al alcanzarlo para no devolver ganancias.", GroupName = "6. Guardrails", Order = 2)]
+        public double DailyProfitCapUsd { get; set; }
+
+        [Range(0, 100000), NinjaScriptProperty]
+        [Display(Name = "Lifetime profit target USD", Description = "Auto-disable al alcanzar +$3000 (señal para mover a PA).", GroupName = "6. Guardrails", Order = 3)]
+        public double LifetimeProfitTargetUsd { get; set; }
+
+        #endregion
+
+        // ===================== ESTADO INTERNO =====================
+        #region State
+
+        // Indicadores
+        private EMA ema8;
+        private SMA sma20;
+        private VWAP vwap;
+        private SMA volSma;
+        private ATR atr;
+        private OrderFlowCumulativeDelta cumDelta;
+
+        // Niveles del día previo (calculados desde DataSeries diaria, BarsArray[1])
+        private double pdh = double.NaN, pdl = double.NaN, pdc = double.NaN;
+
+        // Opening Range del día actual
+        private double orHigh = double.NaN, orLow = double.NaN;
+        private bool orFrozen = false;
+        private DateTime orFreezeAt = DateTime.MinValue;
+
+        // Sesión / día
+        private DateTime currentSessionDate = DateTime.MinValue;
+        private bool sessionLocked = false;   // tras cierre externo o cap alcanzado
+        private MarketPosition lastObservedPosition = MarketPosition.Flat;
+
+        // Conteos diarios
+        private int tradesToday = 0;
+        private double realizedPnLToday = 0;
+        private double lifetimeRealizedPnL = 0;
+
+        // Conversion CDMX (México NO hace DST desde 2022 — UTC-6 todo el año)
+        private TimeZoneInfo cdmxTz;
+        private TimeZoneInfo chicagoTz;
+
+        #endregion
+
+        // ===================== OVERRIDES =====================
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description = "ScalpingNQMorning — port del Pine v4. Rompimiento PDH/PDL/OR en sesión mañana CDMX con filtros EMA/VWAP/Vol/Delta. Diseñado para Apex 50K + Emotional Manager + Replicator.";
+                Name        = "ScalpingNQMorning";
+
+                Calculate                                   = Calculate.OnBarClose;
+                EntriesPerDirection                         = 1;
+                EntryHandling                               = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy                = true;
+                ExitOnSessionCloseSeconds                   = 30;
+                IsFillLimitOnTouch                          = false;
+                MaximumBarsLookBack                         = MaximumBarsLookBack.TwoHundredFiftySix;
+                OrderFillResolution                         = OrderFillResolution.Standard;
+                Slippage                                    = 0;
+                StartBehavior                               = StartBehavior.WaitUntilFlat;
+                TimeInForce                                 = TimeInForce.Gtc;
+                TraceOrders                                 = false;
+                RealtimeErrorHandling                       = RealtimeErrorHandling.StopCancelClose;
+                StopTargetHandling                          = StopTargetHandling.PerEntryExecution;
+                BarsRequiredToTrade                         = 30;
+                IsInstantiatedOnEachOptimizationIteration   = true;
+
+                // Defaults alineados al Pine v4 + ajuste de delta a 50 (pendiente del 18-may)
+                SessionStartCdmx        = 830;
+                SessionEndCdmx          = 1200;
+                OpeningRangeMins        = 15;
+                UsePdhPdl               = true;
+                UseOpeningRange         = true;
+                UseEma                  = true;
+                UseVwap                 = true;
+                UseVol                  = false;   // override actual del usuario
+                VolLen                  = 20;
+                UseDelta                = true;
+                DeltaPctMin             = 50.0;
+                AtrLen                  = 14;
+                SlAtr                   = 1.0;
+                RrRatio                 = 2.0;
+                ContractsQty            = 5;
+                MaxTradesPerDay         = 5;
+                DailyLossCapUsd         = 300;
+                DailyProfitCapUsd       = 300;
+                LifetimeProfitTargetUsd = 3000;
+            }
+            else if (State == State.Configure)
+            {
+                // Series diaria del MISMO instrumento → BarsArray[1] entrega
+                // O/H/L/C del día previo cerrado.
+                AddDataSeries(Instrument.FullName, BarsPeriodType.Day, 1);
+            }
+            else if (State == State.DataLoaded)
+            {
+                ema8     = EMA(BarsArray[0], 8);
+                sma20    = SMA(BarsArray[0], 20);
+                vwap     = VWAP(BarsArray[0]);
+                volSma   = SMA(Volumes[0], VolLen);
+                atr      = ATR(BarsArray[0], AtrLen);
+                cumDelta = OrderFlowCumulativeDelta(
+                              BarsArray[0],
+                              CumulativeDeltaType.BidAsk,
+                              CumulativeDeltaPeriod.Bar,
+                              0);
+
+                cdmxTz    = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time (Mexico)");
+                chicagoTz = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
+            }
+        }
+
+        // ----------------------------------------------------------
+        // OnBarUpdate — la lógica core, corre por cada barra cerrada
+        // ----------------------------------------------------------
+        protected override void OnBarUpdate()
+        {
+            // Sólo procesamos la serie primaria (5m); la daily (BarsArray[1])
+            // se usa para leer PDH/PDL/PDC.
+            if (BarsInProgress != 0) return;
+            if (CurrentBars[0] < BarsRequiredToTrade) return;
+            if (CurrentBars[1] < 2) return;
+
+            // ---- 1. Hora del exchange (Chicago) → hora CDMX
+            DateTime tNow = Time[0];                                  // exchange time (Chicago)
+            DateTime tCdmx = ConvertChicagoToCdmx(tNow);
+            int hhmmNow = tCdmx.Hour * 100 + tCdmx.Minute;
+            DateTime today = tCdmx.Date;
+
+            // ---- 2. Detectar nuevo día CDMX → resetear estado
+            if (today != currentSessionDate)
+            {
+                currentSessionDate = today;
+                tradesToday        = 0;
+                realizedPnLToday   = 0;
+                sessionLocked      = false;
+                orHigh             = double.NaN;
+                orLow              = double.NaN;
+                orFrozen           = false;
+
+                // Lee niveles del día previo desde la serie diaria
+                pdh = Highs[1][1];      // [1][1] = bar 1 de la serie diaria = ayer cerrado
+                pdl = Lows[1][1];
+                pdc = Closes[1][1];
+
+                Print($"[{tCdmx:yyyy-MM-dd}] Nuevo día — PDH={pdh:F2} PDL={pdl:F2} PDC={pdc:F2}");
+            }
+
+            // ---- 3. Sesión activa?
+            bool inSession = hhmmNow >= SessionStartCdmx && hhmmNow < SessionEndCdmx;
+
+            // ---- 4. Construcción del Opening Range
+            if (inSession && !orFrozen)
+            {
+                if (double.IsNaN(orHigh))
+                {
+                    orHigh = High[0];
+                    orLow  = Low[0];
+                    orFreezeAt = tCdmx.AddMinutes(OpeningRangeMins);
+                }
+                else
+                {
+                    if (High[0] > orHigh) orHigh = High[0];
+                    if (Low[0]  < orLow)  orLow  = Low[0];
+                }
+
+                if (tCdmx >= orFreezeAt)
+                {
+                    orFrozen = true;
+                    Print($"[{tCdmx:HH:mm}] OR fijado — High={orHigh:F2} Low={orLow:F2}");
+                }
+            }
+
+            // ---- 5. Detección de cierre externo (Emotional Manager u otro)
+            //         Si estábamos en posición y aparecemos Flat sin haber sido
+            //         nuestros SL/TP los que cerraron → asumir externo.
+            if (lastObservedPosition != MarketPosition.Flat
+                && Position.MarketPosition == MarketPosition.Flat
+                && !sessionLocked)
+            {
+                // Conservador: cualquier flat inesperado bloquea el resto del día.
+                sessionLocked = true;
+                Print($"[{tCdmx:HH:mm}] Posición cerrada externamente — bot SESSION-LOCKED hasta mañana.");
+            }
+            lastObservedPosition = Position.MarketPosition;
+
+            // ---- 6. Guardrails
+            if (!inSession || sessionLocked) return;
+            if (tradesToday >= MaxTradesPerDay) { LockDay($"Max trades/día {MaxTradesPerDay} alcanzado."); return; }
+            if (realizedPnLToday <= -DailyLossCapUsd) { LockDay($"Daily loss cap -${DailyLossCapUsd} alcanzado."); return; }
+            if (realizedPnLToday >=  DailyProfitCapUsd) { LockDay($"Daily profit cap +${DailyProfitCapUsd} alcanzado."); return; }
+            if (lifetimeRealizedPnL >= LifetimeProfitTargetUsd) { LockDay($"Lifetime target +${LifetimeProfitTargetUsd} alcanzado — mover a PA."); return; }
+
+            // ---- 7. Filtros
+            bool emaBull = !UseEma  || ema8[0] > sma20[0];
+            bool emaBear = !UseEma  || ema8[0] < sma20[0];
+
+            double vwapVal = vwap.Value[0];
+            bool vwapBull  = !UseVwap || Close[0] > vwapVal;
+            bool vwapBear  = !UseVwap || Close[0] < vwapVal;
+
+            bool volOk     = !UseVol  || Volume[0] > volSma[0];
+
+            double deltaBar = cumDelta.DeltaClose[0];
+            double deltaPct = (UseDelta && Volume[0] > 0)
+                              ? Math.Abs(deltaBar) / Volume[0] * 100.0
+                              : 0;
+            bool deltaBull  = !UseDelta || (deltaBar > 0 && deltaPct >= DeltaPctMin);
+            bool deltaBear  = !UseDelta || (deltaBar < 0 && deltaPct >= DeltaPctMin);
+
+            // ---- 8. Detección de rompimientos (cruce desde la barra previa)
+            bool breakPdh = UsePdhPdl       && !double.IsNaN(pdh) && Close[1] <= pdh && Close[0] > pdh;
+            bool breakPdl = UsePdhPdl       && !double.IsNaN(pdl) && Close[1] >= pdl && Close[0] < pdl;
+            bool breakOrH = UseOpeningRange && orFrozen && Close[1] <= orHigh && Close[0] > orHigh;
+            bool breakOrL = UseOpeningRange && orFrozen && Close[1] >= orLow  && Close[0] < orLow;
+
+            // ---- 9. Señal LONG
+            if ((breakPdh || breakOrH)
+                && emaBull && vwapBull && volOk && deltaBull
+                && Position.MarketPosition == MarketPosition.Flat)
+            {
+                EnterBracket("Long_break", true, deltaPct);
+                return;
+            }
+
+            // ---- 10. Señal SHORT
+            if ((breakPdl || breakOrL)
+                && emaBear && vwapBear && volOk && deltaBear
+                && Position.MarketPosition == MarketPosition.Flat)
+            {
+                EnterBracket("Short_break", false, deltaPct);
+                return;
+            }
+        }
+
+        // ----------------------------------------------------------
+        // OnExecutionUpdate — trackeo de P&L diario / lifetime
+        // ----------------------------------------------------------
+        protected override void OnExecutionUpdate(Execution execution, string executionId,
+                                                  double price, int quantity,
+                                                  MarketPosition marketPosition,
+                                                  string orderId, DateTime time)
+        {
+            if (execution.Order == null) return;
+            if (execution.Order.OrderState != OrderState.Filled) return;
+
+            // Cuando la posición vuelve a Flat = trade cerrado
+            if (Position.MarketPosition == MarketPosition.Flat
+                && SystemPerformance.AllTrades.Count > 0)
+            {
+                Trade last = SystemPerformance.AllTrades[SystemPerformance.AllTrades.Count - 1];
+                double profit = last.ProfitCurrency;
+                realizedPnLToday   += profit;
+                lifetimeRealizedPnL = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+
+                Print($"[{time:HH:mm}] Trade cerrado P&L=${profit:F2}  día=${realizedPnLToday:F2}  total=${lifetimeRealizedPnL:F2}");
+            }
+        }
+
+        // ===================== HELPERS =====================
+
+        private void EnterBracket(string signalName, bool isLong, double deltaPct)
+        {
+            double slPts  = atr[0] * SlAtr;
+            double entry  = Close[0];
+            double stop   = isLong ? entry - slPts : entry + slPts;
+            double target = isLong ? entry + slPts * RrRatio : entry - slPts * RrRatio;
+
+            SetStopLoss(signalName, CalculationMode.Price, stop, false);
+            SetProfitTarget(signalName, CalculationMode.Price, target);
+
+            if (isLong) EnterLong(ContractsQty, signalName);
+            else        EnterShort(ContractsQty, signalName);
+
+            tradesToday++;
+
+            DateTime tCdmx = ConvertChicagoToCdmx(Time[0]);
+            Print($"[{tCdmx:HH:mm}] {(isLong ? "LONG" : "SHORT")} @ {entry:F2}  SL={stop:F2}  TP={target:F2}  ΔPct={deltaPct:F1}  trades hoy={tradesToday}");
+        }
+
+        private void LockDay(string reason)
+        {
+            if (sessionLocked) return;
+            sessionLocked = true;
+            DateTime tCdmx = ConvertChicagoToCdmx(Time[0]);
+            Print($"[{tCdmx:HH:mm}] Día bloqueado: {reason}");
+        }
+
+        private DateTime ConvertChicagoToCdmx(DateTime chicago)
+        {
+            // Time[0] viene en hora del exchange (Chicago).
+            // En invierno CT == CDMX (ambos UTC-6).
+            // En verano CT = UTC-5, CDMX = UTC-6 (México no hace DST desde 2022).
+            // Conversión robusta vía UTC.
+            try
+            {
+                DateTime utc = TimeZoneInfo.ConvertTimeToUtc(
+                    DateTime.SpecifyKind(chicago, DateTimeKind.Unspecified),
+                    chicagoTz);
+                return TimeZoneInfo.ConvertTimeFromUtc(utc, cdmxTz);
+            }
+            catch
+            {
+                // Fallback: si las TZ no existen en este Windows, usar Chicago tal cual
+                return chicago;
+            }
+        }
+    }
+}

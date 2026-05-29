@@ -1,0 +1,67 @@
+// ============================================================================
+// Scalping NQ Morning - Breakout Signals (Pine v4 — referencia)
+//
+// Script Pine actual del usuario en TradingView:
+//   - Script ID: USER;27704178c73b43faa28df680b9e4237b
+//   - Nombre archivo: "ESTRATEGIA IA"
+//   - Título display: "Scalping NQ Morning - Breakout Signals"
+//
+// ⚠️ TODO: pegar aquí el código Pine real cuando el usuario abra el chart NQ1!
+//          en TradingView Desktop y podamos leerlo con `pine_get_source` del
+//          MCP de TradingView.
+//
+// Spec actual (de memoria, ver project_tv_scalping_indicator.md):
+//
+// Inputs (con IDs para indicator_set_inputs):
+//   in_0  sessStr        = "0830-1200"     ventana CDMX
+//   in_1  closeOutEOD
+//   in_2  showPDL
+//   in_3  showOR
+//   in_4  orMins         = 15 (override actual: 10)
+//   in_5  useEMA         = true
+//   in_6  useVWAP        = true
+//   in_7  useVol         = false (override actual)
+//   in_8  volLen         = 20
+//   in_9  atrLen         = 14
+//   in_10 slATR          = 1.0
+//   in_11 rrRatio        = 2.0
+//   in_12 contracts      = 5
+//   in_13 tickUSD        = 2.0
+//   in_14 dailyGoal      = 150
+//   in_15 useDelta       = true
+//   in_16 deltaPctMin    = 60 → bajar a 50 (pendiente 18-may)
+//   in_17 deltaLTF       = "1" (minuto)
+//
+// Lógica:
+//   • Dibuja PDH/PDL/PDC (día previo, sincronizado America/Mexico_City)
+//   • Define Opening Range = high/low de los primeros orMins minutos de sesión
+//   • Fondo azul en ventana 8:30-12:00 CDMX
+//   • Señales BUY/SELL al romper PDH/PDL/OR-High/OR-Low con TODOS estos filtros:
+//       - useEMA: ema(close,8) > sma(close,20) para BUY
+//       - useVWAP: precio del lado correcto del VWAP daily
+//       - useVol: volumen > sma(volume, 20)
+//       - useDelta: |delta_LTF/vol_LTF| * 100 >= deltaPctMin
+//                   y signo del delta coincide con dirección
+//                   (calculado con request.security_lower_tf en LTF=1m)
+//   • Cada señal dibuja label con Entry/SL/TP en puntos y USD + Δ%
+//   • Tabla esquina sup-derecha: PDH, PDL, ATR, $/pt, meta pts, sesión, Δ%
+//   • 6 alertcondition:
+//       - COMPRA NQ
+//       - VENTA NQ
+//       - Cruza PDH
+//       - Cruza PDL
+//       - Rompe OR alto
+//       - Rompe OR bajo
+//
+// La traducción a NinjaScript vive en:
+//   nt8/strategies/ScalpingNQMorning.cs
+//
+// Diferencias del port C# vs Pine:
+//   • C# además tiene guardrails Apex (daily loss, max trades, profit cap,
+//     auto-disable lifetime) y detección de cierre externo por Emotional Mgr.
+//   • C# usa OrderFlowCumulativeDelta nativo de NT8 8.1+ en vez de
+//     request.security_lower_tf.
+//   • C# emite órdenes reales (EnterLong/EnterShort + bracket OCO), Pine
+//     sólo dibuja señales.
+//
+// ============================================================================
