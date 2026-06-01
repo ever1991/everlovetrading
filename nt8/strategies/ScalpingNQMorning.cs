@@ -165,6 +165,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int tradesToday = 0;
         private double realizedPnLToday = 0;
         private double lifetimeRealizedPnL = 0;
+        // CumProfit snapshot al inicio del día CDMX. realizedPnLToday se deriva
+        // como (CumProfit actual − este snapshot), robusto ante exits que se
+        // llenan en varios fills: esos crean múltiples Trade records y antes,
+        // al sumar solo AllTrades[last], se subcontaba la pérdida (bug 01-jun:
+        // stop real -$125 reportado como -$50, riesgo para el daily loss cap).
+        private double sessionStartCumProfit = 0;
 
         // Conversion CDMX (México NO hace DST desde 2022 — UTC-6 todo el año)
         private TimeZoneInfo cdmxTz;
@@ -287,13 +293,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ---- 2. Detectar nuevo día CDMX → resetear estado
             if (today != currentSessionDate)
             {
-                currentSessionDate = today;
-                tradesToday        = 0;
-                realizedPnLToday   = 0;
-                sessionLocked      = false;
-                orHigh             = double.NaN;
-                orLow              = double.NaN;
-                orFrozen           = false;
+                currentSessionDate    = today;
+                tradesToday           = 0;
+                sessionStartCumProfit = CumProfit();
+                realizedPnLToday      = 0;
+                sessionLocked         = false;
+                orHigh                = double.NaN;
+                orLow                 = double.NaN;
+                orFrozen              = false;
 
                 // Lee niveles del día previo desde la serie diaria
                 pdh = Highs[1][1];      // [1][1] = bar 1 de la serie diaria = ayer cerrado
@@ -358,6 +365,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // ---- 6. Guardrails
             if (!inSession || sessionLocked) return;
+
+            // Recalcular P&L del día desde la fuente autoritativa (CumProfit) en
+            // CADA barra → el daily loss cap siempre evalúa el número real,
+            // aunque un OnExecutionUpdate se pierda o un exit se llene en partes.
+            realizedPnLToday    = CumProfit() - sessionStartCumProfit;
+            lifetimeRealizedPnL = CumProfit();
+
             if (tradesToday >= MaxTradesPerDay) { LockDay($"Max trades/día {MaxTradesPerDay} alcanzado."); return; }
             if (realizedPnLToday <= -DailyLossCapUsd) { LockDay($"Daily loss cap -${DailyLossCapUsd} alcanzado."); return; }
             if (realizedPnLToday >=  DailyProfitCapUsd) { LockDay($"Daily profit cap +${DailyProfitCapUsd} alcanzado."); return; }
@@ -426,12 +440,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (Position.MarketPosition == MarketPosition.Flat
                 && SystemPerformance.AllTrades.Count > 0)
             {
-                Trade last = SystemPerformance.AllTrades[SystemPerformance.AllTrades.Count - 1];
-                double profit = last.ProfitCurrency;
-                realizedPnLToday   += profit;
-                lifetimeRealizedPnL = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+                // P&L del trade = delta del CumProfit desde el último cierre.
+                // Captura el trade COMPLETO aunque el exit se haya llenado en
+                // varios fills (que generan múltiples Trade records). Antes
+                // leíamos solo AllTrades[last] y subcontábamos la pérdida.
+                double cumNow   = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+                double tradePnL = cumNow - lifetimeRealizedPnL;
+                lifetimeRealizedPnL = cumNow;
+                realizedPnLToday    = cumNow - sessionStartCumProfit;
 
-                Print($"[{time:HH:mm}] Trade cerrado P&L=${profit:F2}  día=${realizedPnLToday:F2}  total=${lifetimeRealizedPnL:F2}");
+                Print($"[{time:HH:mm}] Trade cerrado P&L=${tradePnL:F2}  día=${realizedPnLToday:F2}  total=${lifetimeRealizedPnL:F2}");
 
                 // Detección robusta de cierre externo:
                 // - Si la orden ejecutada tiene FromEntrySignal == Long_break / Short_break
@@ -493,6 +511,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             sessionLocked = true;
             DateTime tCdmx = ConvertChicagoToCdmx(Time[0]);
             Print($"[{tCdmx:HH:mm}] Día bloqueado: {reason}");
+        }
+
+        // P&L realizado acumulado (lifetime) según SystemPerformance. Devuelve 0
+        // si aún no hay trades, para evitar excepciones al inicio de sesión.
+        private double CumProfit()
+        {
+            return SystemPerformance.AllTrades.Count > 0
+                   ? SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit
+                   : 0.0;
         }
 
         private DateTime ConvertChicagoToCdmx(DateTime chicago)
