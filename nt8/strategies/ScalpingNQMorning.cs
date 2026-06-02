@@ -112,6 +112,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Contratos por trade (MNQ)", Description = "Apex 50K: máx 60 MNQ. Default 5 alineado a la spec.", GroupName = "5. Riesgo", Order = 3)]
         public int ContractsQty { get; set; }
 
+        [NinjaScriptProperty]
+        [Display(Name = "TP/SL fijos en USD (en vez de ATR)", Description = "ON: usa Take Profit USD / Stop Loss USD. OFF: usa ATR×SlAtr y RR.", GroupName = "5. Riesgo", Order = 4)]
+        public bool UseFixedDollarRisk { get; set; }
+
+        [Range(1, 100000), NinjaScriptProperty]
+        [Display(Name = "Take Profit USD", Description = "Ganancia objetivo por trade (posición completa). Solo si TP/SL fijos = ON.", GroupName = "5. Riesgo", Order = 5)]
+        public double TpUsd { get; set; }
+
+        [Range(1, 100000), NinjaScriptProperty]
+        [Display(Name = "Stop Loss USD", Description = "Pérdida máxima por trade (posición completa). Solo si TP/SL fijos = ON.", GroupName = "5. Riesgo", Order = 6)]
+        public double SlUsd { get; set; }
+
         // ---------- Guardrails (Apex + defensa en profundidad) ----------
         [Range(1, 50), NinjaScriptProperty]
         [Display(Name = "Max trades por día", GroupName = "6. Guardrails", Order = 0)]
@@ -220,9 +232,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SlAtr                   = 1.0;
                 RrRatio                 = 2.0;
                 ContractsQty            = 5;
+                UseFixedDollarRisk      = true;   // 02-jun: usuario pidió TP/SL fijos en USD
+                TpUsd                   = 500;    // TP $500 con 5 MNQ ≈ 50 pts
+                SlUsd                   = 300;    // SL $300 con 5 MNQ ≈ 30 pts
                 MaxTradesPerDay         = 5;
                 DailyLossCapUsd         = 300;
-                DailyProfitCapUsd       = 300;
+                DailyProfitCapUsd       = 500;   // 02-jun: usuario subió el profit cap a $500 (loss cap se queda en $300; Emotional Manager como respaldo)
                 LifetimeProfitTargetUsd = 3000;
             }
             else if (State == State.Configure)
@@ -488,10 +503,28 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void EnterBracket(string signalName, bool isLong, double deltaPct)
         {
-            double slPts  = atr[0] * SlAtr;
             double entry  = Close[0];
+            double slPts, tpPts;
+
+            if (UseFixedDollarRisk)
+            {
+                // Convierte $ → puntos según el valor del punto del instrumento y
+                // el nº de contratos. Para MNQ: PointValue=$2, 5 contratos → $10/pt.
+                // SlUsd=300 → 30 pts ; TpUsd=500 → 50 pts. Riesgo por trade BLINDADO
+                // al monto exacto, inmune al ATR (resuelve el stop gigante en días
+                // de alta volatilidad).
+                double dollarPerPoint = Instrument.MasterInstrument.PointValue * ContractsQty;
+                slPts = SlUsd / dollarPerPoint;
+                tpPts = TpUsd / dollarPerPoint;
+            }
+            else
+            {
+                slPts = atr[0] * SlAtr;
+                tpPts = slPts * RrRatio;
+            }
+
             double stop   = isLong ? entry - slPts : entry + slPts;
-            double target = isLong ? entry + slPts * RrRatio : entry - slPts * RrRatio;
+            double target = isLong ? entry + tpPts : entry - tpPts;
 
             SetStopLoss(signalName, CalculationMode.Price, stop, false);
             SetProfitTarget(signalName, CalculationMode.Price, target);
@@ -501,8 +534,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             tradesToday++;
 
+            double riskUsd   = slPts * Instrument.MasterInstrument.PointValue * ContractsQty;
+            double rewardUsd = tpPts * Instrument.MasterInstrument.PointValue * ContractsQty;
+
             DateTime tCdmx = ConvertChicagoToCdmx(Time[0]);
-            Print($"[{tCdmx:HH:mm}] {(isLong ? "LONG" : "SHORT")} @ {entry:F2}  SL={stop:F2}  TP={target:F2}  ΔPct={deltaPct:F1}  trades hoy={tradesToday}");
+            Print($"[{tCdmx:HH:mm}] {(isLong ? "LONG" : "SHORT")} @ {entry:F2}  SL={stop:F2} (-${riskUsd:F0})  TP={target:F2} (+${rewardUsd:F0})  ΔPct={deltaPct:F1}  trades hoy={tradesToday}");
         }
 
         private void LockDay(string reason)
