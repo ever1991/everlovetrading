@@ -36,6 +36,9 @@ using NinjaTrader.NinjaScript.Strategies;
 //     detecta Flat-inesperado y se session-lockea hasta el siguiente día.
 //   • Daily loss interno $300 (más estricto que el cap $1k del gestor)
 //   • Auto-disable al alcanzar +$3000 lifetime (señal para mover a PA)
+//   • OpenRiskMode (04-jun, default ON): sin SL/TP por trade ni topes diarios;
+//     la posición solo cierra al fin de sesión y el Gestor Emocional gobierna
+//     el riesgo. Apagar el switch para volver al comportamiento blindado.
 //
 // Repo: https://github.com/ever1991/everlovetrading
 // ============================================================================
@@ -123,6 +126,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(1, 100000), NinjaScriptProperty]
         [Display(Name = "Stop Loss USD", Description = "Pérdida máxima por trade (posición completa). Solo si TP/SL fijos = ON.", GroupName = "5. Riesgo", Order = 6)]
         public double SlUsd { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "⚠️ Modo RIESGO ABIERTO (sin SL/TP ni topes)", Description = "ON: NO coloca Stop Loss ni Take Profit por trade y desactiva los topes diarios (loss/profit cap). La posición solo cierra al fin de sesión. Pensado para correr con un Gestor Emocional externo. OFF: respeta SL/TP y topes normales.", GroupName = "5. Riesgo", Order = 7)]
+        public bool OpenRiskMode { get; set; }
 
         // ---------- Guardrails (Apex + defensa en profundidad) ----------
         [Range(1, 50), NinjaScriptProperty]
@@ -235,6 +242,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 UseFixedDollarRisk      = true;   // 02-jun: usuario pidió TP/SL fijos en USD
                 TpUsd                   = 500;    // TP $500 con 5 MNQ ≈ 50 pts
                 SlUsd                   = 300;    // SL $300 con 5 MNQ ≈ 30 pts
+                OpenRiskMode            = true;   // 04-jun: usuario corre con Gestor Emocional externo; sin SL/TP ni topes diarios, solo cierra al fin de sesión
                 MaxTradesPerDay         = 5;
                 DailyLossCapUsd         = 300;
                 DailyProfitCapUsd       = 500;   // 02-jun: usuario subió el profit cap a $500 (loss cap se queda en $300; Emotional Manager como respaldo)
@@ -388,8 +396,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             lifetimeRealizedPnL = CumProfit();
 
             if (tradesToday >= MaxTradesPerDay) { LockDay($"Max trades/día {MaxTradesPerDay} alcanzado."); return; }
-            if (realizedPnLToday <= -DailyLossCapUsd) { LockDay($"Daily loss cap -${DailyLossCapUsd} alcanzado."); return; }
-            if (realizedPnLToday >=  DailyProfitCapUsd) { LockDay($"Daily profit cap +${DailyProfitCapUsd} alcanzado."); return; }
+            // OpenRiskMode: sin topes diarios de P&L. El Gestor Emocional externo
+            // gobierna cuándo detener el día.
+            if (!OpenRiskMode && realizedPnLToday <= -DailyLossCapUsd) { LockDay($"Daily loss cap -${DailyLossCapUsd} alcanzado."); return; }
+            if (!OpenRiskMode && realizedPnLToday >=  DailyProfitCapUsd) { LockDay($"Daily profit cap +${DailyProfitCapUsd} alcanzado."); return; }
             if (lifetimeRealizedPnL >= LifetimeProfitTargetUsd) { LockDay($"Lifetime target +${LifetimeProfitTargetUsd} alcanzado — mover a PA."); return; }
 
             // ---- 7. Filtros
@@ -526,8 +536,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             double stop   = isLong ? entry - slPts : entry + slPts;
             double target = isLong ? entry + tpPts : entry - tpPts;
 
-            SetStopLoss(signalName, CalculationMode.Price, stop, false);
-            SetProfitTarget(signalName, CalculationMode.Price, target);
+            // OpenRiskMode: sin SL ni TP por trade. La posición solo se cierra por
+            // IsExitOnSessionCloseStrategy (fin de sesión) o por el Gestor Emocional
+            // externo. Si está OFF, se colocan el stop y el target normales.
+            if (!OpenRiskMode)
+            {
+                SetStopLoss(signalName, CalculationMode.Price, stop, false);
+                SetProfitTarget(signalName, CalculationMode.Price, target);
+            }
 
             if (isLong) EnterLong(ContractsQty, signalName);
             else        EnterShort(ContractsQty, signalName);
@@ -538,7 +554,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             double rewardUsd = tpPts * Instrument.MasterInstrument.PointValue * ContractsQty;
 
             DateTime tCdmx = ConvertChicagoToCdmx(Time[0]);
-            Print($"[{tCdmx:HH:mm}] {(isLong ? "LONG" : "SHORT")} @ {entry:F2}  SL={stop:F2} (-${riskUsd:F0})  TP={target:F2} (+${rewardUsd:F0})  ΔPct={deltaPct:F1}  trades hoy={tradesToday}");
+            string riskTxt = OpenRiskMode
+                ? "SL=ABIERTO  TP=ABIERTO (cierra al fin de sesión)"
+                : $"SL={stop:F2} (-${riskUsd:F0})  TP={target:F2} (+${rewardUsd:F0})";
+            Print($"[{tCdmx:HH:mm}] {(isLong ? "LONG" : "SHORT")} @ {entry:F2}  {riskTxt}  ΔPct={deltaPct:F1}  trades hoy={tradesToday}");
         }
 
         private void LockDay(string reason)
