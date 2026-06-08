@@ -1,67 +1,171 @@
 // ============================================================================
-// Scalping NQ Morning - Breakout Signals (Pine v4 — referencia)
+// Scalping NQ Morning - Breakout Signals  (FUENTE REAL capturada 2026-06-05)
 //
-// Script Pine actual del usuario en TradingView:
+// Script Pine v6 del usuario en TradingView:
 //   - Script ID: USER;27704178c73b43faa28df680b9e4237b
 //   - Nombre archivo: "ESTRATEGIA IA"
 //   - Título display: "Scalping NQ Morning - Breakout Signals"
 //
-// ⚠️ TODO: pegar aquí el código Pine real cuando el usuario abra el chart NQ1!
-//          en TradingView Desktop y podamos leerlo con `pine_get_source` del
-//          MCP de TradingView.
-//
-// Spec actual (de memoria, ver project_tv_scalping_indicator.md):
-//
-// Inputs (con IDs para indicator_set_inputs):
-//   in_0  sessStr        = "0830-1200"     ventana CDMX
-//   in_1  closeOutEOD
-//   in_2  showPDL
-//   in_3  showOR
-//   in_4  orMins         = 15 (override actual: 10)
-//   in_5  useEMA         = true
-//   in_6  useVWAP        = true
-//   in_7  useVol         = false (override actual)
-//   in_8  volLen         = 20
-//   in_9  atrLen         = 14
-//   in_10 slATR          = 1.0
-//   in_11 rrRatio        = 2.0
-//   in_12 contracts      = 5
-//   in_13 tickUSD        = 2.0
-//   in_14 dailyGoal      = 150
-//   in_15 useDelta       = true
-//   in_16 deltaPctMin    = 60 → bajar a 50 (pendiente 18-may)
-//   in_17 deltaLTF       = "1" (minuto)
-//
-// Lógica:
-//   • Dibuja PDH/PDL/PDC (día previo, sincronizado America/Mexico_City)
-//   • Define Opening Range = high/low de los primeros orMins minutos de sesión
-//   • Fondo azul en ventana 8:30-12:00 CDMX
-//   • Señales BUY/SELL al romper PDH/PDL/OR-High/OR-Low con TODOS estos filtros:
-//       - useEMA: ema(close,8) > sma(close,20) para BUY
-//       - useVWAP: precio del lado correcto del VWAP daily
-//       - useVol: volumen > sma(volume, 20)
-//       - useDelta: |delta_LTF/vol_LTF| * 100 >= deltaPctMin
-//                   y signo del delta coincide con dirección
-//                   (calculado con request.security_lower_tf en LTF=1m)
-//   • Cada señal dibuja label con Entry/SL/TP en puntos y USD + Δ%
-//   • Tabla esquina sup-derecha: PDH, PDL, ATR, $/pt, meta pts, sesión, Δ%
-//   • 6 alertcondition:
-//       - COMPRA NQ
-//       - VENTA NQ
-//       - Cruza PDH
-//       - Cruza PDL
-//       - Rompe OR alto
-//       - Rompe OR bajo
-//
-// La traducción a NinjaScript vive en:
-//   nt8/strategies/ScalpingNQMorning.cs
-//
-// Diferencias del port C# vs Pine:
-//   • C# además tiene guardrails Apex (daily loss, max trades, profit cap,
-//     auto-disable lifetime) y detección de cierre externo por Emotional Mgr.
-//   • C# usa OrderFlowCumulativeDelta nativo de NT8 8.1+ en vez de
-//     request.security_lower_tf.
-//   • C# emite órdenes reales (EnterLong/EnterShort + bracket OCO), Pine
-//     sólo dibuja señales.
-//
+// ⚠️ NOTA: esta es la versión SIN filtro Delta (la "v3"). La memoria registraba
+//          una v4 con filtro de orderflow Delta (useDelta/deltaPctMin) que NO
+//          está presente en lo que corre hoy en TradingView. Ver
+//          project_tv_scalping_indicator.md.
 // ============================================================================
+
+//@version=6
+indicator("Scalping NQ Morning - Breakout Signals", overlay=true, max_labels_count=500, max_lines_count=100)
+
+// =========================================================
+//  Scalping NQ/MNQ - Sesión mañana México (8:30 - 12:00)
+//  Señales de alta probabilidad: niveles día previo +
+//  Opening Range + filtros EMA / VWAP / volumen.
+//  Default: 5 MNQ => $10/pt => 15 pts = $150 meta
+// =========================================================
+
+// ============== INPUTS ==============
+gS = "⏰ Sesión"
+sessStr     = input.session("0830-1200", "Horario (hora CDMX)", group=gS)
+tz          = "America/Mexico_City"
+closeOutEOD = input.bool(true, "Sólo señalar dentro de sesión", group=gS)
+
+gL = "📏 Niveles"
+showPDL = input.bool(true, "Mostrar PDH / PDL / PDC",                 group=gL)
+showOR  = input.bool(true, "Mostrar Opening Range (OR)",              group=gL)
+orMins  = input.int(5,     "Minutos del OR",    minval=5, maxval=60,  group=gL)  // 05-jun: 15→5 para disparar antes y más entradas
+
+gF = "🎯 Filtros alta probabilidad"
+useEMA  = input.bool(true, "Filtro EMA 8 / SMA 20 (tendencia)", group=gF)
+useVWAP = input.bool(true, "Filtro VWAP (lado del precio)",     group=gF)
+useVol  = input.bool(true, "Volumen > promedio",                group=gF)
+volLen  = input.int(20,    "Periodo volumen", minval=5,         group=gF)
+
+gR = "💰 Gestión de riesgo"
+atrLen    = input.int(14,    "ATR periodo", minval=5,             group=gR)
+slATR     = input.float(1.0, "SL en ATR", minval=0.3, step=0.1,   group=gR)
+rrRatio   = input.float(2.0, "Ratio R:R", minval=0.5, step=0.1,   group=gR)
+contracts = input.int(5,     "Contratos (MNQ)", minval=1,         group=gR)
+tickUSD   = input.float(2.0, "USD por punto por contrato (MNQ=2, NQ=20)", group=gR)
+dailyGoal = input.float(150.0,"Meta diaria USD",                  group=gR)
+
+ptValue = contracts * tickUSD
+
+// ============== SESIÓN ==============
+inSess  = not na(time(timeframe.period, sessStr, tz))
+newSess = inSess and not inSess[1]
+
+// ============== NIVELES DIA PREVIO ==============
+pdh = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_on)
+pdc = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+
+plot(showPDL ? pdh : na, "PDH", color=color.new(color.red,   0), linewidth=2, style=plot.style_linebr)
+plot(showPDL ? pdl : na, "PDL", color=color.new(color.green, 0), linewidth=2, style=plot.style_linebr)
+plot(showPDL ? pdc : na, "PDC", color=color.new(color.gray,  0), linewidth=1, style=plot.style_linebr)
+
+// ============== OPENING RANGE ==============
+var float orH    = na
+var float orL    = na
+var int   orEnd  = na
+var bool  orDone = false
+
+if newSess
+    orH    := high
+    orL    := low
+    orEnd  := time + orMins * 60 * 1000
+    orDone := false
+
+if inSess and not na(orEnd) and time <= orEnd
+    orH := math.max(nz(orH, high), high)
+    orL := math.min(nz(orL, low),  low)
+
+if inSess and not na(orEnd) and time > orEnd and not orDone
+    orDone := true
+
+plot(showOR and inSess ? orH : na, "OR High", color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+plot(showOR and inSess ? orL : na, "OR Low",  color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+
+// ============== INDICADORES ==============
+emaF   = ta.ema(close, 8)
+smaS   = ta.sma(close, 20)
+bull   = emaF > smaS
+bear   = emaF < smaS
+
+vwapV  = ta.vwap(hlc3)
+aboveV = close > vwapV
+belowV = close < vwapV
+
+atrV   = ta.atr(atrLen)
+volAvg = ta.sma(volume, volLen)
+volOK  = volume > volAvg
+
+// ============== CRUCES (scope global para consistencia) ==============
+xPDH = ta.crossover(close, pdh)
+xPDL = ta.crossunder(close, pdl)
+xORH = ta.crossover(close, nz(orH, close))
+xORL = ta.crossunder(close, nz(orL, close))
+
+// ============== FILTROS COMBINADOS ==============
+longOK  = (not useEMA  or bull)  and (not useVWAP or aboveV) and (not useVol or volOK)
+shortOK = (not useEMA  or bear)  and (not useVWAP or belowV) and (not useVol or volOK)
+
+sessFilter = not closeOutEOD or inSess
+
+// ============== ROMPIMIENTOS ==============
+breakPDH = sessFilter and xPDH and longOK
+breakPDL = sessFilter and xPDL and shortOK
+breakORH = sessFilter and orDone and not na(orH) and xORH and longOK
+breakORL = sessFilter and orDone and not na(orL) and xORL and shortOK
+
+longSig  = breakPDH or breakORH
+shortSig = breakPDL or breakORL
+
+// ============== SEÑALES EN CHART ==============
+plotshape(longSig,  "COMPRA", location=location.belowbar, color=color.new(color.green,0), style=shape.triangleup,   size=size.small, text="BUY")
+plotshape(shortSig, "VENTA",  location=location.abovebar, color=color.new(color.red,  0), style=shape.triangledown, size=size.small, text="SELL")
+
+// ============== LABELS CON SL / TP ==============
+if longSig
+    sl = close - atrV * slATR
+    tp = close + atrV * slATR * rrRatio
+    usdTP = (tp - close) * ptValue
+    usdSL = (close - sl) * ptValue
+    txt = str.format("LONG @ {0,number,#.##}\nSL {1,number,#.##} (-${4,number,#.##})\nTP {2,number,#.##} (+${3,number,#.##})", close, sl, tp, usdTP, usdSL)
+    label.new(bar_index, high + atrV*0.3, txt, color=color.new(color.green,20), textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+if shortSig
+    sl = close + atrV * slATR
+    tp = close - atrV * slATR * rrRatio
+    usdTP = (close - tp) * ptValue
+    usdSL = (sl - close) * ptValue
+    txt = str.format("SHORT @ {0,number,#.##}\nSL {1,number,#.##} (-${4,number,#.##})\nTP {2,number,#.##} (+${3,number,#.##})", close, sl, tp, usdTP, usdSL)
+    label.new(bar_index, low - atrV*0.3, txt, color=color.new(color.red,20), textcolor=color.white, style=label.style_label_up, size=size.normal)
+
+// ============== FONDO SESIÓN ==============
+bgcolor(inSess ? color.new(color.blue, 92) : na, title="Ventana de operación")
+
+// ============== TABLA INFO (esquina) ==============
+var table info = table.new(position.top_right, 2, 7, border_width=1)
+if barstate.islast
+    table.cell(info, 0, 0, "NQ Scalping", bgcolor=color.new(color.blue, 70), text_color=color.white)
+    table.cell(info, 1, 0, str.tostring(timeframe.period), bgcolor=color.new(color.blue, 70), text_color=color.white)
+    table.cell(info, 0, 1, "PDH",  text_color=color.red)
+    table.cell(info, 1, 1, str.tostring(pdh, "#.##"))
+    table.cell(info, 0, 2, "PDL",  text_color=color.green)
+    table.cell(info, 1, 2, str.tostring(pdl, "#.##"))
+    table.cell(info, 0, 3, "ATR",  text_color=color.gray)
+    table.cell(info, 1, 3, str.tostring(atrV, "#.##"))
+    ptsNeeded = dailyGoal / ptValue
+    table.cell(info, 0, 4, "$/pt",    text_color=color.gray)
+    table.cell(info, 1, 4, str.tostring(ptValue, "#.##"))
+    table.cell(info, 0, 5, "Meta pts",text_color=color.gray)
+    table.cell(info, 1, 5, str.tostring(ptsNeeded, "#.##"))
+    table.cell(info, 0, 6, "Sesión", text_color=color.gray)
+    table.cell(info, 1, 6, inSess ? "ACTIVA" : "Cerrada", text_color=inSess ? color.green : color.red)
+
+// ============== ALERTAS ==============
+alertcondition(longSig,   title="COMPRA NQ",      message="🟢 COMPRA NQ: rompimiento alcista confirmado")
+alertcondition(shortSig,  title="VENTA NQ",       message="🔴 VENTA NQ: rompimiento bajista confirmado")
+alertcondition(xPDH,      title="Cruza PDH",      message="⚠️ Precio cruzó PDH (máximo día previo)")
+alertcondition(xPDL,      title="Cruza PDL",      message="⚠️ Precio cruzó PDL (mínimo día previo)")
+alertcondition(breakORH,  title="Rompe OR alto",  message="🟢 Rompimiento Opening Range alcista")
+alertcondition(breakORL,  title="Rompe OR bajo",  message="🔴 Rompimiento Opening Range bajista")
