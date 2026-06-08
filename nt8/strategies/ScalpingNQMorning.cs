@@ -36,9 +36,11 @@ using NinjaTrader.NinjaScript.Strategies;
 //     detecta Flat-inesperado y se session-lockea hasta el siguiente día.
 //   • Daily loss interno $300 (más estricto que el cap $1k del gestor)
 //   • Auto-disable al alcanzar +$3000 lifetime (señal para mover a PA)
-//   • OpenRiskMode (04-jun, default ON): sin SL/TP por trade ni topes diarios;
-//     la posición solo cierra al fin de sesión y el Gestor Emocional gobierna
-//     el riesgo. Apagar el switch para volver al comportamiento blindado.
+//   • OpenRiskMode (08-jun, default OFF): SL/TP por trade y topes diarios
+//     ACTIVOS. Cada trade lleva su stop ($200) y target ($300) reales, y al
+//     cerrarse libera la posición para re-entrar (más trades/día). El Gestor
+//     Emocional externo queda como respaldo. Prender el switch solo para volver
+//     al modo "aguanta hasta fin de sesión sin stop".
 //
 // Repo: https://github.com/ever1991/everlovetrading
 // ============================================================================
@@ -240,12 +242,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RrRatio                 = 2.0;
                 ContractsQty            = 5;
                 UseFixedDollarRisk      = true;   // 02-jun: usuario pidió TP/SL fijos en USD
-                TpUsd                   = 500;    // TP $500 con 5 MNQ ≈ 50 pts
-                SlUsd                   = 300;    // SL $300 con 5 MNQ ≈ 30 pts
-                OpenRiskMode            = true;   // 04-jun: usuario corre con Gestor Emocional externo; sin SL/TP ni topes diarios, solo cierra al fin de sesión
-                MaxTradesPerDay         = 5;
-                DailyLossCapUsd         = 300;
-                DailyProfitCapUsd       = 500;   // 02-jun: usuario subió el profit cap a $500 (loss cap se queda en $300; Emotional Manager como respaldo)
+                TpUsd                   = 300;    // 08-jun: TP $300 con 5 MNQ = 30 pts (1:1.5)
+                SlUsd                   = 200;    // 08-jun: SL $200 con 5 MNQ = 20 pts
+                OpenRiskMode            = false;  // 08-jun: SL/TP por trade REACTIVADOS + topes diarios; al cerrar un trade permite re-entrada (más trades/día). Gestor Emocional = respaldo externo
+                MaxTradesPerDay         = 3;      // 08-jun: máx 3 entradas/día
+                DailyLossCapUsd         = 400;    // 08-jun: 2 stops ($200 c/u) y se apaga el día
+                DailyProfitCapUsd       = 600;   // 08-jun: ~2 ganadores = día verde hecho; ajustable en el diálogo de la estrategia
                 LifetimeProfitTargetUsd = 3000;
             }
             else if (State == State.Configure)
