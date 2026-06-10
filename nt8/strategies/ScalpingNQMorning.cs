@@ -35,7 +35,14 @@ using NinjaTrader.NinjaScript.Strategies;
 //   • Si el Emotional Manager cierra la posición externamente, el bot
 //     detecta Flat-inesperado y se session-lockea hasta el siguiente día.
 //   • Daily loss interno $300 (más estricto que el cap $1k del gestor)
-//   • Auto-disable al alcanzar +$3000 lifetime (señal para mover a PA)
+//   • Auto-disable al alcanzar el lifetime target (default $6000/cuenta;
+//     señal para mover a PA). Es por cuenta: CumProfit de la instancia.
+//   • Breakout ARMADO + retest (10-jun): un cruce de nivel arma la dirección
+//     ArmBars velas (default 6 = 30m). Entra en cuanto EMA/VWAP se alinean
+//     dentro de la ventana (no solo en la vela del cruce) y re-arma en el
+//     retest. Resuelve el "casi no entra": antes exigía cruce + filtros en
+//     la MISMA vela, perdiendo la señal si el cruce era con gap o sin
+//     alineación instantánea.
 //   • OpenRiskMode (08-jun, default OFF): SL/TP por trade y topes diarios
 //     ACTIVOS. Cada trade lleva su stop ($200) y target ($300) reales, y al
 //     cerrarse libera la posición para re-entrar (más trades/día). El Gestor
@@ -73,6 +80,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Operar rompimiento OR High/Low", GroupName = "2. Niveles", Order = 1)]
         public bool UseOpeningRange { get; set; }
+
+        [Range(1, 60), NinjaScriptProperty]
+        [Display(Name = "Ventana de armado (velas)", Description = "Tras romper un nivel, el setup queda ARMADO esta cantidad de velas. Entra en cuanto EMA/VWAP se alineen dentro de la ventana (no solo en la vela del cruce), y re-arma si hace pullback y vuelve a romper. Default 6 = 30 min en 5m. Subir = más entradas.", GroupName = "2. Niveles", Order = 2)]
+        public int ArmBars { get; set; }
 
         // ---------- Filtros técnicos ----------
         [NinjaScriptProperty]
@@ -146,8 +157,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Daily profit cap USD (apaga día)", Description = "Apaga al alcanzarlo para no devolver ganancias.", GroupName = "6. Guardrails", Order = 2)]
         public double DailyProfitCapUsd { get; set; }
 
-        [Range(0, 100000), NinjaScriptProperty]
-        [Display(Name = "Lifetime profit target USD", Description = "Auto-disable al alcanzar +$3000 (señal para mover a PA).", GroupName = "6. Guardrails", Order = 3)]
+        [Range(0, 1000000), NinjaScriptProperty]
+        [Display(Name = "Lifetime profit target USD", Description = "Auto-disable al alcanzarlo (señal para mover a PA). Es por CUENTA: CumProfit de esa instancia. Ajústalo por cuenta a tu target real. 0 = desactivado.", GroupName = "6. Guardrails", Order = 3)]
         public double LifetimeProfitTargetUsd { get; set; }
 
         #endregion
@@ -176,6 +187,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double orHigh = double.NaN, orLow = double.NaN;
         private bool orFrozen = false;
         private DateTime orFreezeAt = DateTime.MinValue;
+
+        // Armado de rompimiento (breakout armado + retest):
+        // al cruzar un nivel se "arma" la dirección por ArmBars velas. Mientras
+        // siga armado y el precio se mantenga del lado roto, entra en cuanto los
+        // filtros (EMA/VWAP) se alineen — no solo en la vela del cruce.
+        private int    longArmedBars  = 0;
+        private int    shortArmedBars = 0;
+        private double longArmLevel   = double.NaN;
+        private double shortArmLevel  = double.NaN;
 
         // Sesión / día
         private DateTime currentSessionDate = DateTime.MinValue;
@@ -231,6 +251,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 OpeningRangeMins        = 15;
                 UsePdhPdl               = true;
                 UseOpeningRange         = true;
+                ArmBars                 = 6;      // 10-jun: breakout armado + retest — tras romper, 6 velas (30m) para que EMA/VWAP se alineen y entre. Sube las entradas.
                 UseEma                  = true;
                 UseVwap                 = true;
                 UseVol                  = false;   // override actual del usuario
@@ -248,7 +269,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxTradesPerDay         = 3;      // 08-jun: máx 3 entradas/día
                 DailyLossCapUsd         = 400;    // 08-jun: 2 stops ($200 c/u) y se apaga el día
                 DailyProfitCapUsd       = 600;   // 08-jun: ~2 ganadores = día verde hecho; ajustable en el diálogo de la estrategia
-                LifetimeProfitTargetUsd = 3000;
+                LifetimeProfitTargetUsd = 6000;  // 10-jun: subido de 3000 → 6000 (por cuenta). Ajústalo por cuenta a tu target real; 0 = desactivado.
             }
             else if (State == State.Configure)
             {
@@ -326,6 +347,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 orHigh                = double.NaN;
                 orLow                 = double.NaN;
                 orFrozen              = false;
+                longArmedBars         = 0;
+                shortArmedBars        = 0;
+                longArmLevel          = double.NaN;
+                shortArmLevel         = double.NaN;
 
                 // Lee niveles del día previo desde la serie diaria
                 pdh = Highs[1][1];      // [1][1] = bar 1 de la serie diaria = ayer cerrado
@@ -433,23 +458,46 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool breakOrH = UseOpeningRange && orFrozen && Close[1] <= orHigh && Close[0] > orHigh;
             bool breakOrL = UseOpeningRange && orFrozen && Close[1] >= orLow  && Close[0] < orLow;
 
-            // ---- 9. Señal LONG
-            if ((breakPdh || breakOrH)
+            // ---- 8b. ARMADO: un cruce fresco arma la dirección por ArmBars velas.
+            //          Guarda el nivel roto; un nuevo cruce re-arma (cubre el retest:
+            //          si hace pullback bajo el nivel y vuelve a romper, se re-arma).
+            if (breakPdh || breakOrH)
+            {
+                longArmedBars = ArmBars;
+                longArmLevel  = breakPdh ? pdh : orHigh;   // PDH tiene prioridad si coinciden
+            }
+            if (breakPdl || breakOrL)
+            {
+                shortArmedBars = ArmBars;
+                shortArmLevel  = breakPdl ? pdl : orLow;
+            }
+
+            // ---- 9. Señal LONG — armada, precio aún sobre el nivel roto y filtros OK.
+            //          Permite entrar en la vela del cruce O en las siguientes ArmBars
+            //          velas cuando EMA/VWAP por fin se alinean.
+            if (longArmedBars > 0 && Close[0] > longArmLevel
                 && emaBull && vwapBull && volOk && deltaBull
                 && Position.MarketPosition == MarketPosition.Flat)
             {
                 EnterBracket("Long_break", true, deltaPct);
+                longArmedBars = 0;   // consumir el armado tras entrar
                 return;
             }
 
             // ---- 10. Señal SHORT
-            if ((breakPdl || breakOrL)
+            if (shortArmedBars > 0 && Close[0] < shortArmLevel
                 && emaBear && vwapBear && volOk && deltaBear
                 && Position.MarketPosition == MarketPosition.Flat)
             {
                 EnterBracket("Short_break", false, deltaPct);
+                shortArmedBars = 0;
                 return;
             }
+
+            // ---- 11. Caducar el armado (1 vela menos). Va al final para que la
+            //          vela del cruce todavía pueda entrar arriba.
+            if (longArmedBars  > 0) longArmedBars--;
+            if (shortArmedBars > 0) shortArmedBars--;
         }
 
         // ----------------------------------------------------------
