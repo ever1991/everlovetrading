@@ -24,7 +24,7 @@ indicator("Scalping NQ Morning - Breakout Signals", overlay=true, max_labels_cou
 
 // ============== INPUTS ==============
 gS = "⏰ Sesión"
-sessStr     = input.session("0830-1200", "Horario (hora CDMX)", group=gS)
+sessStr     = input.session("0745-1200", "Horario (hora CDMX)", group=gS)
 tz          = "America/Mexico_City"
 closeOutEOD = input.bool(true, "Sólo señalar dentro de sesión", group=gS)
 
