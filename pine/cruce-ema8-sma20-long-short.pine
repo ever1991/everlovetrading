@@ -1,0 +1,24 @@
+//@version=5
+// Cruce EMA 8 y SMA 20 con señales LONG / SHORT y alertas.
+// Reconstruido tras sobrescritura accidental (2026-07-15) + etiquetas LONG/SHORT.
+indicator("Cruce EMA 8 y SMA 20", overlay = true)
+
+ema8  = ta.ema(close, 8)
+sma20 = ta.sma(close, 20)
+
+colLong  = color.new(color.green, 0)
+colShort = color.new(color.red,   0)
+
+// EMA8 pinta verde cuando va por arriba de la SMA20 (sesgo long), roja si va por abajo.
+emaCol = ema8 >= sma20 ? colLong : colShort
+plot(ema8,  "EMA 8",  color = emaCol,      linewidth = 2)
+plot(sma20, "SMA 20", color = color.blue,  linewidth = 2)
+
+cruceAlcista = ta.crossover(ema8, sma20)   // LONG
+cruceBajista = ta.crossunder(ema8, sma20)  // SHORT
+
+plotshape(cruceAlcista, title = "LONG",  style = shape.labelup,   location = location.belowbar, color = colLong,  text = "LONG",  textcolor = color.white, size = size.small)
+plotshape(cruceBajista, title = "SHORT", style = shape.labeldown, location = location.abovebar, color = colShort, text = "SHORT", textcolor = color.white, size = size.small)
+
+alertcondition(cruceAlcista, title = "LONG - EMA8 cruza ARRIBA SMA20", message = "LONG · Cruce alcista EMA8/SMA20")
+alertcondition(cruceBajista, title = "SHORT - EMA8 cruza ABAJO SMA20", message = "SHORT · Cruce bajista EMA8/SMA20")

@@ -1,0 +1,28 @@
+//@version=6
+// Calm Feed NQ - emite niveles al webhook maestro de Calm.
+// Alerta: "Any alert() function call" + Webhook URL:
+//   https://calm-trading.vercel.app/api/webhooks/market/NQ?key=<TU_TOKEN>
+indicator("Calm Feed NQ", overlay = true)
+
+pdh = request.security(syminfo.tickerid, "D", high[1])
+pdl = request.security(syminfo.tickerid, "D", low[1])
+pdc = request.security(syminfo.tickerid, "D", close[1])
+
+piv = (pdh + pdl + pdc) / 3.0
+r1 = 2 * piv - pdl
+s1 = 2 * piv - pdh
+
+vwapv = ta.vwap(hlc3)
+ema8v = ta.ema(close, 8)
+sma20v = ta.sma(close, 20)
+atrv = ta.atr(14)
+poc = piv
+
+j = '{"price":' + str.tostring(close) + ',"pdh":' + str.tostring(pdh) + ',"pdl":' + str.tostring(pdl) + ',"poc":' + str.tostring(poc) + ',"vwap":' + str.tostring(vwapv) + ',"s1":' + str.tostring(s1) + ',"r1":' + str.tostring(r1) + ',"atr":' + str.tostring(atrv) + ',"ema8":' + str.tostring(ema8v) + ',"sma20":' + str.tostring(sma20v) + '}'
+
+alert(j, alert.freq_once_per_bar_close)
+
+plot(pdh, "PDH", color.new(color.red, 40))
+plot(pdl, "PDL", color.new(color.green, 40))
+plot(vwapv, "VWAP", color.new(color.blue, 0))
+plot(poc, "POC", color.new(color.orange, 30))
